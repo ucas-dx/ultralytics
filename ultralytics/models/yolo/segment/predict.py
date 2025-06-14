@@ -62,9 +62,22 @@ class SegmentationPredictor(DetectionPredictor):
             >>> predictor = SegmentationPredictor(overrides=dict(model="yolo11n-seg.pt"))
             >>> results = predictor.postprocess(preds, img, orig_img)
         """
-        # Extract protos - tuple if PyTorch model or array if exported
+        head = getattr(self.model.model, "model", self.model.model)[-1]
+        if hasattr(head, "predict_masks") and not isinstance(preds[1], (list, tuple)):
+            return self._postprocess_fine(preds, img, orig_imgs)
         protos = preds[1][-1] if isinstance(preds[1], tuple) else preds[1]
         return super().postprocess(preds[0], img, orig_imgs, protos=protos)
+
+    def _postprocess_fine(self, preds, img, orig_imgs):
+        dets = super().postprocess(preds[0], img, orig_imgs)
+        head = getattr(self.model.model, "model", self.model.model)[-1]
+        masks = head.predict_masks(preds[1], dets, [x.shape[:2] for x in orig_imgs])
+        results = []
+        for det, mask, orig, path in zip(dets, masks, orig_imgs, self.batch[0]):
+            if len(det):
+                det[:, :4] = ops.scale_boxes(img.shape[2:], det[:, :4], orig.shape)
+            results.append(Results(orig, path=path, names=self.model.names, boxes=det[:, :6], masks=mask))
+        return results
 
     def construct_results(self, preds, img, orig_imgs, protos):
         """

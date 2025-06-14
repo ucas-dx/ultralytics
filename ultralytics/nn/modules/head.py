@@ -11,13 +11,14 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import fuse_conv_and_bn, smart_inference_mode
+from torchvision.ops import RoIAlign
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "FineSegment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
 
 class Detect(nn.Module):
@@ -208,6 +209,46 @@ class Segment(Detect):
         if self.training:
             return x, mc, p
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class FineSegment(Detect):
+    """Instance segmentation head using ROIAlign-based masks instead of protos."""
+
+    def __init__(self, nc=80, mask_size=28, ch=()):
+        """Initialize ROIAlign-based mask head with output mask size."""
+        super().__init__(nc, ch)
+        self.mask_size = mask_size
+        self.mask_fpn = Conv(ch[0], 256, k=3)
+        self.roi_align = RoIAlign((mask_size, mask_size), spatial_scale=1 / 8, sampling_ratio=2)
+        self.mask_head = nn.Sequential(
+            nn.ConvTranspose2d(256, 256, 2, 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, 1),
+        )
+
+    def forward(self, x):
+        """Return detections and mask features."""
+        masks = self.mask_fpn(x[0])
+        det = Detect.forward(self, x)
+        return (det, masks)
+
+    def predict_masks(self, masks, preds, shapes):
+        """Generate instance masks given features and predictions."""
+        bs = masks.shape[0]
+        stride = self.stride[0]
+        results = []
+        for i in range(bs):
+            det = preds[i]
+            if len(det):
+                boxes = det[:, :4] / stride
+                rois = torch.cat([torch.full((len(boxes), 1), i, device=boxes.device), boxes], 1)
+                roi = self.roi_align(masks, rois)
+                m = self.mask_head(roi).squeeze(1).sigmoid()
+                m = F.interpolate(m.unsqueeze(0), shapes[i], mode="bilinear", align_corners=False)[0]
+            else:
+                m = torch.zeros((0, shapes[i][0], shapes[i][1]), device=masks.device)
+            results.append(m)
+        return results
 
 
 class OBB(Detect):

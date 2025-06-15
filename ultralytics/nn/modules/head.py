@@ -230,7 +230,10 @@ class FineSegment(Detect):
         """Return detections and mask features."""
         masks = self.mask_fpn(x[0])
         det = Detect.forward(self, x)
-        return (det, masks)
+        if self.training:
+            return det, masks
+        det = det[0] if isinstance(det, tuple) else det
+        return det, masks
 
     def predict_masks(self, masks, preds, shapes):
         """Generate instance masks given features and predictions."""

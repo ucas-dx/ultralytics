@@ -275,10 +275,15 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model)
         self.overlap = model.args.overlap_mask
+        self.head = model.model[-1]
 
     def __call__(self, preds, batch):
         """Calculate and return the combined loss for detection and segmentation."""
         loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
+
+        if hasattr(self.head, "roi_align") and len(preds) == 2:
+            return self._forward_fine(preds, batch, loss)
+
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -449,6 +454,88 @@ class v8SegmentationLoss(v8DetectionLoss):
                 loss += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
 
         return loss / fg_mask.sum()
+
+    def _forward_fine(self, preds, batch, loss):
+        """Loss computation for ROIAlign-based mask head."""
+        feats, mask_feat = preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 4), 2)
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"
+                "This error can occur when incorrectly training a 'segment' model on a 'detect' dataset, "
+                "i.e. 'yolo train model=yolo11n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
+                "correctly formatted 'segment' dataset using 'data=coco8-seg.yaml' "
+                "as an example.\nSee https://docs.ultralytics.com/datasets/segment/ for help."
+            ) from e
+
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[3] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+            masks = batch["masks"].to(self.device).float()
+            loss[1] = self._fine_mask_loss(mask_feat, fg_mask, target_gt_idx, masks, batch_idx, target_bboxes)
+        else:
+            loss[1] += (mask_feat * 0).sum()
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.box
+        loss[2] *= self.hyp.cls
+        loss[3] *= self.hyp.dfl
+
+        return loss * batch_size, loss.detach()
+
+    def _fine_mask_loss(self, mask_feat, fg_mask, target_gt_idx, masks, batch_idx, target_bboxes):
+        """Compute binary cross entropy loss on cropped ROI masks."""
+        bs, _, h, w = mask_feat.shape
+        total_loss = 0.0
+        count = fg_mask.sum()
+        for i in range(bs):
+            m = fg_mask[i]
+            if m.any():
+                boxes = target_bboxes[i, m]
+                rois = torch.cat([torch.full((len(boxes), 1), i, device=mask_feat.device), boxes], 1)
+                roi = self.head.roi_align(mask_feat, rois)
+                pred = self.head.mask_head(roi).squeeze(1)
+                gt_idx = target_gt_idx[i, m]
+                gt = masks[batch_idx.view(-1) == i][gt_idx]
+                gt = F.interpolate(gt.unsqueeze(1), pred.shape[-2:], mode="nearest").squeeze(1)
+                total_loss += F.binary_cross_entropy_with_logits(pred, gt, reduction="mean")
+            else:
+                total_loss += (mask_feat[i] * 0).sum()
+        return total_loss / count.clamp_(min=1)
 
 
 class v8PoseLoss(v8DetectionLoss):

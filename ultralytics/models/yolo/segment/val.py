@@ -100,8 +100,11 @@ class SegmentationValidator(DetectionValidator):
             p (torch.Tensor): Processed detection predictions.
             proto (torch.Tensor): Prototype masks for segmentation.
         """
+        head = getattr(self.model.model, "model", self.model.model)[-1]
         p = super().postprocess(preds[0])
-        proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]  # second output is len 3 if pt, but only 1 if exported
+        if hasattr(head, "predict_masks") and not isinstance(preds[1], (list, tuple)):
+            return p, preds[1]
+        proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]
         return p, proto
 
     def _prepare_batch(self, si, batch):
@@ -134,7 +137,11 @@ class SegmentationValidator(DetectionValidator):
             pred_masks (torch.Tensor): Processed mask predictions.
         """
         predn = super()._prepare_pred(pred, pbatch)
-        pred_masks = self.process(proto, pred[:, 6:], pred[:, :4], shape=pbatch["imgsz"])
+        head = getattr(self.model.model, "model", self.model.model)[-1]
+        if hasattr(head, "predict_masks") and proto.ndim == 3:
+            pred_masks = head.predict_masks(proto.unsqueeze(0), [predn], [pbatch["ori_shape"]])[0]
+        else:
+            pred_masks = self.process(proto, pred[:, 6:], pred[:, :4], shape=pbatch["imgsz"])
         return predn, pred_masks
 
     def update_metrics(self, preds, batch):
